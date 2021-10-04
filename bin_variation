@@ -1,0 +1,98 @@
+SELECT variation.*
+FROM
+   (SELECT
+        uuid() as alert_id,
+        'BIN_VARIATION' as alert_name,
+        'ANOMALY' as alert_type,
+        b.merchant, 
+        merch.merchant_name,
+        merch.industry,
+        'CARD' as payment_method,
+        b.countrycode as country_code,
+        cast(CURRENT_TIMESTAMP as timestamp) as alert_date,
+        'BIN' as anomaly_field,
+        b.bin as anomaly_field_value,
+        'PERC_QUANTITY' as type,
+        case when avg >= 1000 and (perc_avg_3_desv - perc_avg < 5) then round(perc_avg + 5, 2)
+             when avg < 1000 and (perc_avg_3_desv - perc_avg < 10) then round(perc_avg + 10, 2)
+             else perc_avg_3_desv end as type_limit,
+        round(perc_cnt, 2) as type_value
+    FROM
+       (--Construimos los parámetros para cada bin, country, merchant
+        SELECT bin,
+           countrycode,
+           merchant,
+           max(max(dist_days)) over (partition by countrycode, merchant) as qty_dist_days,
+           sum(cnt) as total,
+           avg(cnt) as avg,
+           avg(perc_cnt) as perc_avg,
+           approx_percentile(perc_cnt, 0.9) AS perc_pctl_90,
+           stddev_samp(perc_cnt) AS perc_stddev,
+           round(avg(perc_cnt) + 3 * stddev_samp(perc_cnt), 2) as perc_avg_3_desv
+        FROM
+           (SELECT CAST(created AS DATE) AS date,
+               dense_rank() over (partition by countrycode, merchant order by CAST(created AS DATE)) as dist_days,
+               req_creditcard_bin as bin,
+               countrycode,
+               merchant,
+               count(caseid) as cnt,
+               count(caseid) * 100.0 / sum(count(caseid)) over (partition by CAST(created AS DATE), countrycode, merchant) as perc_cnt
+            FROM
+               (select *,
+                       row_number() over (partition by caseid) as row_number
+                from communication_logs.sherlock_analysis
+                where cast(created AS date) >= current_date - interval '32' day
+                   and cast(created AS date) < current_date - interval '1' day
+                   and req_operation_type not in ('CASH','PAYOUT')
+                   and res_result = 'ACCEPT'
+                )
+            WHERE row_number = 1 
+            GROUP BY CAST(created AS DATE), req_creditcard_bin, countrycode, merchant
+            ORDER BY count(caseid) desc
+           )
+        GROUP BY bin, countrycode, merchant) a
+    INNER JOIN
+       (--Construimos los valores de las últimas 24 hs para bin, merchant, country
+        select
+           req_creditcard_bin as bin,
+           countrycode,
+           merchant,
+           count(caseid) cnt,
+           count(caseid) * 100.0 / sum(count(caseid)) over(partition by countrycode, merchant) perc_cnt
+        from
+           (select *,
+                   row_number() over (partition by caseid) as row_number
+            from communication_logs.sherlock_analysis
+            where (cast(created AS date) = current_date or
+                (cast(created AS date) = current_date - interval '1' day 
+                    and cast(hour as bigint) > extract(hour from current_time)))
+                and req_operation_type not in ('CASH','PAYOUT')
+                and res_result = 'ACCEPT'
+            )
+        where row_number = 1
+        group by 1,2,3
+        order by count(caseid) desc
+       ) as b
+        ON a.bin = b.bin and a.countrycode = b.countrycode and a.merchant = b.merchant
+    LEFT JOIN default.merchant_data_pf AS merch
+        ON a.merchant = merch.merchant_reference and a.countrycode = merch.country_code
+    WHERE a.perc_stddev > 0
+        and (perc_cnt > (case when avg >= 1000 and (perc_avg_3_desv - perc_avg < 5) then perc_avg + 5
+                             when avg < 1000 and (perc_avg_3_desv - perc_avg < 10) then perc_avg + 10
+                             else perc_avg_3_desv end))
+        and cnt > 100
+        and a.qty_dist_days > 10
+    ) variation
+LEFT JOIN
+       (--Para que la alerta no se repita 
+        select row_number () over (partition by anomaly_field_value, country_code, merchant order by alert_date desc) as row_number, *
+        from fraud_alert.alert
+        where alert_name = 'BIN_VARIATION'
+       ) bin_var
+    ON variation.anomaly_field_value = bin_var.anomaly_field_value and variation.country_code = bin_var.country_code 
+        and variation.merchant = bin_var.merchant
+WHERE --pedimos que la alerta sea nueva o que tenga al menos 7 dias de antiguedad
+    (bin_var.anomaly_field_value is null
+        and bin_var.country_code is null
+        and bin_var.merchant is null) or
+    (bin_var.row_number = 1 and cast(bin_var.alert_date as date) <= current_date - interval '7' day)
