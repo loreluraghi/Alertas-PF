@@ -1,0 +1,103 @@
+WITH a AS 
+    (SELECT payment_method,
+        countrycode,
+        merchant,
+        count(distinct date) qty_dist_days,
+        count(distinct (case when cnt_reject = 0 and cnt > 100 then date else null end)) qty_dist_days_wo_fp, 
+        sum(cnt_reject) / sum(cnt) as total_reject,
+        sum(cnt) as total,
+        avg(cnt) as avg,
+        avg(perc_reject) as perc_avg,
+        approx_percentile(perc_reject, 0.9) as perc_90,
+        stddev_samp(perc_reject) as perc_stddev,
+        case when stddev_samp(perc_reject) < 2 then round(avg(perc_reject) + 3 * stddev_samp(perc_reject), 2) 
+             when stddev_samp(perc_reject) < 8 then round(avg(perc_reject) + 2 * stddev_samp(perc_reject), 2)
+             else round(avg(perc_reject) + 1.5 * stddev_samp(perc_reject), 2) end as perc_avg_desv
+    FROM
+        (SELECT CAST(created AS DATE) AS date,
+            case when req_operation_type in ('WITH_CVV', 'WITHOUT_CVV', 'TOKEN') then 'CARD'
+                 else req_operation_type end as payment_method,
+            countrycode,
+            merchant,
+            sum(case when res_result = 'REJECT' then 1 else 0 end) as cnt_reject, 
+            count(caseid) AS cnt,
+            sum(case when res_result = 'REJECT' then 1 else 0 end) * 100.0 / count(caseid) as perc_reject
+        FROM 
+            (select *,
+                    row_number() over (partition by caseid order by created desc) as row_number
+             from communication_logs.sherlock_analysis
+             where cast(created AS date) > current_date - interval '32' day
+                and cast(created AS date) < current_date - interval '1' day
+                and res_result in ('ACCEPT', 'REJECT')
+             )
+        WHERE row_number = 1
+        GROUP BY  1,2,3,4
+        ORDER BY  1,2 desc
+        )
+    GROUP BY  payment_method, countrycode, merchant
+    )
+, b AS
+    (SELECT
+        case when req_operation_type in ('WITH_CVV', 'WITHOUT_CVV', 'TOKEN') then 'CARD'
+             else req_operation_type end as payment_method,
+        countrycode,
+        merchant,
+        sum(case when res_result = 'REJECT' then 1 else 0 end) as cnt_reject, 
+        count(caseid) AS cnt,
+        sum(case when res_result = 'REJECT' then 1.00 else 0 end) * 100 / count(caseid) as perc_reject
+    FROM 
+        (select *,
+                row_number() over (partition by caseid order by created desc) as row_number
+         from communication_logs.sherlock_analysis
+         where (cast(created AS date) = current_date or 
+            (cast(created AS date) = current_date - interval '1' day and cast(hour as bigint) > extract(hour from current_time)))
+            and res_result in ('ACCEPT', 'REJECT')
+         )
+    WHERE row_number = 1
+    GROUP BY  1,2,3
+    ORDER BY  1,2 desc
+    )
+, merch AS 
+    (select * 
+    from default.merchant_data_pf
+    )
+SELECT alerta_0.*
+FROM 
+    (SELECT 
+        uuid() as alert_id,
+        'WITHOUT_SHERLOCK_REJECT' as alert_name,
+        'INTEGRITY' as alert_type,
+        b.merchant,  
+        merch.merchant_name,
+        merch.industry,
+        b.payment_method, 
+        b.countrycode as country_code, 
+        cast(current_timestamp as timestamp) as alert_date,
+        null as anomaly_field,
+        null as anomaly_field_value,
+        null as type,
+        null as type_limit,
+        null as type_value
+    FROM a
+    INNER JOIN b
+        ON a.payment_method = b.payment_method and a.countrycode = b.countrycode and a.merchant = b.merchant
+    LEFT JOIN merch
+        ON a.merchant = merch.merchant_reference and a.countrycode = merch.country_code
+    WHERE qty_dist_days > 10
+        and ((cnt > 100 and perc_avg > 10 and qty_dist_days_wo_fp < 7) 
+                or (cnt > 1000 and perc_avg > 5 and qty_dist_days_wo_fp < 5) 
+                or (cnt > 10000 and perc_avg > 0 and qty_dist_days_wo_fp < 2))
+        and b.cnt_reject = 0
+    ) alerta_0
+LEFT JOIN 
+    (select row_number () over (partition by payment_method, country_code, merchant order by alert_date desc) as row_number, *
+    from fraud_alert.alert
+    where alert_name in ('WITHOUT_FP', 'WITHOUT_SHERLOCK_REJECT')
+    ) tabla_0
+        ON  alerta_0.payment_method = tabla_0.payment_method and
+            alerta_0.country_code = tabla_0.country_code and
+            alerta_0.merchant = tabla_0.merchant 
+WHERE (tabla_0.payment_method is null and 
+       tabla_0.country_code is null and 
+       tabla_0.merchant is null) or 
+    (tabla_0.row_number = 1 and cast(tabla_0.alert_date as date) <= current_date - interval '7' day)
