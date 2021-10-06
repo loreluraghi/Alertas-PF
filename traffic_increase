@@ -1,0 +1,150 @@
+with hist as 
+    (--Histórico de los últimos 3 meses 
+        SELECT month,
+            semana, 
+            dia_de_semana,
+            day,
+            date,
+            payment_method,
+            countrycode,
+            merchant,
+            count(caseid) AS cnt,
+            rank() over (partition by semana, payment_method, countrycode, merchant order by count(caseid) desc) as weekly_order,
+            rank() over (partition by month, payment_method, countrycode, merchant order by count(caseid) desc) as monthly_order,
+            sum(req_usd_amount) as amt
+        FROM 
+            (select cast(created AS date) as date,
+                    extract(week from created) as semana,
+                    extract(day_of_week from created) as dia_de_semana,
+                    case when req_operation_type in ('WITH_CVV', 'WITHOUT_CVV', 'TOKEN') then 'CARD'
+                         else req_operation_type end as payment_method,
+                    row_number() over (partition by caseid) as row_number,
+                    *
+             from communication_logs.sherlock_analysis
+             where cast(created AS date) > current_date - interval '94' day
+                and cast(created AS date) < current_date - interval '1' day
+                and res_result = 'ACCEPT'
+             )
+        WHERE row_number = 1
+          --and payment_method = 'CARD' and countrycode = 'CL' and merchant = '30162'
+        GROUP BY 1,2,3,4,5,6,7,8
+        ORDER BY date
+    )
+, last_30d as
+    (--Parámetros de los últimos 30 dias
+        select payment_method,
+            countrycode,
+            merchant,
+            count(distinct date) qty_dist_days,
+            avg(cnt) as cnt_avg,
+            approx_percentile(cnt, 0.9) AS cnt_perc_90,
+            cast(stddev_samp(cnt) AS decimal) cnt_stddev,
+            avg(amt) as amt_avg,
+            approx_percentile(amt, 0.9) AS amt_perc_90,
+            cast(stddev_samp(amt) AS decimal) amt_stddev
+        from hist
+        where date > current_date - interval '32' day
+        group by payment_method, countrycode, merchant
+    )
+, est_sem as
+    (--Para quitar estacionalidad semanal
+        select payment_method,
+            countrycode,
+            merchant,
+            avg(weekly_order) as hist_weekly_order
+        from hist
+        where dia_de_semana = extract(day_of_week from current_date)
+        group by payment_method, countrycode, merchant
+    )
+, est_mes as
+    (--Para quitar estacionalidad mensual
+        select payment_method,
+            countrycode,
+            merchant,
+            avg(monthly_order) as hist_monthly_order
+        from hist
+        where cast(day as int) = extract(day from current_date)
+        group by payment_method, countrycode, merchant
+    )
+, last_24h as
+    (--Comportamiento de las últimas 24 hs
+        select
+            payment_method,
+            countrycode,
+            merchant,
+            count(caseid) AS cnt,
+            sum(req_usd_amount) as amt
+        from 
+            (select 
+                case when req_operation_type in ('WITH_CVV', 'WITHOUT_CVV', 'TOKEN') then 'CARD'
+                     else req_operation_type end as payment_method,
+                row_number() over (partition by caseid) as row_number,
+                *
+             from communication_logs.sherlock_analysis
+             where (cast(created AS date) = current_date or 
+                (cast(created AS date) = current_date - interval '1' day and cast(hour as bigint) > extract(hour from current_time)))
+                and res_result = 'ACCEPT'
+             )
+        where row_number = 1
+        group by 1,2,3
+        order by 1,2 desc
+    )
+SELECT alerta.*
+FROM 
+    (select 
+        uuid() as alert_id,
+        'TRAFFIC_INCREASE' as alert_name,
+        'ANOMALY' as alert_type,
+        last_24h.merchant,  
+        merch.merchant_name,
+        merch.industry,
+        last_24h.payment_method, 
+        last_24h.countrycode as country_code, 
+        cast(current_timestamp as timestamp) as alert_date,
+        null as anomaly_field,
+        null as anomaly_field_value,
+        case when cnt > round(cnt_avg + 3 * cnt_stddev, 0) then 'QUANTITY'
+             when amt > round(amt_avg + 3 * amt_stddev, 0) then 'AMOUNT' end as type,
+        case when cnt > round(cnt_avg + 3 * cnt_stddev, 0) then round(cnt_avg + 3 * cnt_stddev, 0)
+             when amt > round(amt_avg + 3 * amt_stddev, 0) then round(amt_avg + 3 * amt_stddev, 2) end as type_limit,
+        case when cnt > round(cnt_avg + 3 * cnt_stddev, 0) then cnt
+             when amt > round(amt_avg + 3 * amt_stddev, 0) then round(amt, 2) end as type_value
+    from last_30d
+    inner join last_24h
+        on last_30d.payment_method = last_24h.payment_method 
+            and last_30d.countrycode = last_24h.countrycode 
+            and last_30d.merchant = last_24h.merchant
+    left join est_mes
+        on last_24h.payment_method = est_mes.payment_method
+            and last_24h.countrycode = est_mes.countrycode 
+            and last_24h.merchant = est_mes.merchant
+    left join est_sem
+        on last_24h.payment_method = est_sem.payment_method 
+            and last_24h.countrycode = est_sem.countrycode 
+            and last_24h.merchant = est_sem.merchant
+    left join default.merchant_data_pf AS merch
+        on last_24h.merchant = merch.merchant_reference 
+            and last_24h.countrycode = merch.country_code
+    where --Requerimientos de transaccionalidad
+        cnt > 1000 and amt > 10000 and qty_dist_days > 10
+        --Al menos 3 devios del comportamiento promedio
+        and (cnt > round(cnt_avg + 3 * cnt_stddev, 0) or amt > round(amt_avg + 3 * amt_stddev, 0))
+        --Que en el mismo dia de los meses anteriores, no haya habido en promedio tambén un pico mensual
+        and (est_mes.hist_monthly_order > 2 or hist_monthly_order is null)
+        --Que en el mismo dia de las semanas anteriores, no haya habido en promedio tambén un pico semanal
+        and (est_sem.hist_weekly_order > 2 or hist_weekly_order is null)
+    ) alerta
+LEFT JOIN 
+    ( --Para que la alerta no se repita
+    select row_number () over (partition by payment_method, country_code, merchant order by alert_date desc) as row_number, *
+    from fraud_alert.alert
+    where alert_name = 'TRAFFIC_INCREASE'
+    ) tabla 
+        ON  alerta.payment_method = tabla.payment_method and
+            alerta.country_code = tabla.country_code and
+            alerta.merchant = tabla.merchant 
+WHERE --pedimos que la alerta sea nueva o que tenga al menos 7 dias de antiguedad
+    (tabla.payment_method is null and 
+       tabla.country_code is null and 
+       tabla.merchant is null) or 
+    (tabla.row_number = 1 and cast(tabla.alert_date as date) <= current_date - interval '7' day)
